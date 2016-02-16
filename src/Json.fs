@@ -13,13 +13,13 @@ type private ParseStep<'a> =
             | Done v -> "[Completed Computation]"
             | NoChars _ -> "[End of Input]"
             | AnyChar _ -> "[Any Character]"
-            | CharRange (cs, _) -> "[Any of " + System.String.Join(" ", (cs |> Seq.map string))
+            | CharRange (cs, _) -> "[Any of " + System.String.Join(" ", (cs |> Seq.map string)) + "]"
             | Char (c, _) -> "'" + (c.ToString ()) + "'"
             | Or (p1, p2) -> p1.ToString () + " or " + p2.ToString ()
 
 type private ParseError<'a> =
     | NotError of 'a
-    | Error of ParseStep<'a>
+    | Error of ('a ParseStep * char list)
 
 module private ParseStep =
     let rec bind p f =
@@ -56,9 +56,16 @@ module private ParseStep =
             eval (f x) xs
         | Or (p1, p2), l ->
             match eval p1.Value l with
-            | Error _, _ -> eval p2.Value l
+            | Error (e1,r1), _ ->
+                match eval p2.Value l with
+                | Error (e2, r2), _ ->
+                    if List.length r2 <= List.length r1 then
+                        Error (e2,r2), l
+                    else
+                        Error (e1, r1), l
+                | NotError v, xs -> NotError v, xs
             | NotError v, xs -> NotError v, xs
-        | p, _ -> Error p, l
+        | p, xs -> Error (p, xs), l
 
     let word s v =
         bind (Seq.fold (fun d c -> bind d  (fun _ -> Char (c, Done ()))) (Done ()) s) (fun _ -> Done v)
@@ -120,10 +127,44 @@ let private parseNum =
                      lazy (e) )
     let minus = Or ( lazy(Char ('-', Done ()) >>> (orDot >>= (cons '-' >> Done))),
                      lazy(orDot) )
-    minus <*> (Array.ofSeq >> System.String >> System.Double.Parse)
+    minus <*> (Array.ofSeq >> System.String >> System.Double.Parse) <*> Number
 
-let private parseString = parseStringLit >>= (String >> Done)
+let private parseString = parseStringLit <*> String
 let private parseTrue = ParseStep.word "true" (Bool true)
 let private parseFalse = ParseStep.word "false" (Bool false)
+let private parseBool = Or (lazy (parseFalse), lazy (parseTrue))
 let private parseNull = ParseStep.word "null" Null
+
+let rec private eatWs p = Or ( lazy (CharRange ([' '; '\t'; '\r'; '\n'], fun _ -> eatWs p)),
+                               lazy (p) )
+
+let rec private parseValue () =
+    ParseStep.orOf [ lazy(parseNum)
+                     lazy(parseString)
+                     lazy(parseBool)
+                     lazy(parseNull)
+                     lazy(parseArray ())
+                     lazy(parseObject ()) ]
+
+and private parseArray () =
+    // BUG: allows trailing comma
+    let rec getItems d =
+        eatWs ( Or ( lazy(parseValue () >>= fun v -> anotherItem (v::d)),
+                     lazy(Done (List.rev d)) ) )
+    and anotherItem d =
+        eatWs ( Or ( lazy(Char (',', getItems d)),
+                     lazy(Done d) ) )
+    
+    Char ('[', getItems []) >>= (fun d -> eatWs (Char (']', Done d))) <*> List
+
+and private parseObject () =
+    // BUG: allows trailing comma
+    let rec getItems m =
+        eatWs ( Or ( lazy(parseStringLit >>= (fun k ->
+                        eatWs (Char (':', eatWs (parseValue ()) >>= (fun v -> anotherItem (Map.add k v m)))))),
+                     lazy(Done m)))
+    and anotherItem m =
+        eatWs ( Or ( lazy(Char (',', getItems m)),
+                     lazy(Done m) ) )
+    Char ('{', getItems Map.empty) >>= (fun d -> eatWs (Char ('}', Done d))) <*> Object
 
