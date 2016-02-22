@@ -1,7 +1,7 @@
 module Cthom06.Json
 
 open Cthom06.Au
-open Cthom06.Au.Parser.Operators
+open Cthom06.Au.Operators
 
 let private cons a b = a::b
 let private fcons a b = b::a
@@ -19,81 +19,78 @@ let private parseStringLit =
         if String.length h = 4 then
             Done (System.Convert.ToInt32 (h, 16) |> char)
         else
-            Range ( ['a';'b';'c';'d';'e';'f';'A';'B';'C';'D';'E';'F';'0';'1';'2';'3';'4';'5';'6';'7';'8';'9'],
-                    fun c -> readHex (sprintf "%s%c" h c) )
+            Parser.range
+                ['a';'b';'c';'d';'e';'f';'A';'B';'C';'D';'E';'F';'0';'1';'2';'3';'4';'5';'6';'7';'8';'9']
+                (fun c -> readHex (sprintf "%s%c" h c))
     let backSlash =
-        Parser.orOf
-            [ lazy(Parser.char 'n' (Done '\n'))
-              lazy(Parser.char 'r' (Done '\r'))
-              lazy(Parser.char 'b' (Done '\b'))
-              lazy(Parser.char 'f' (Done '\f'))
-              lazy(Parser.char 't' (Done '\t'))
-              lazy(Parser.char '\\' (Done '\\'))
-              lazy(Parser.char '/' (Done '/'))
-              lazy(Parser.char '"' (Done '"'))
-              lazy(Parser.char 'u' (readHex "")) ]
+        Parser.exactly 'n' (Done '\n')
+        <|> Parser.exactly 'r' (Done '\r')
+        <|> Parser.exactly 'b' (Done '\b')
+        <|> Parser.exactly 'f' (Done '\f')
+        <|> Parser.exactly 't' (Done '\t')
+        <|> Parser.exactly '\\' (Done '\\')
+        <|> Parser.exactly '/' (Done '/')
+        <|> Parser.exactly '"' (Done '"')
+        <|> Parser.exactly 'u' (readHex "")
     let rec readChars l =
-        Parser.orOf
-            [ lazy(Parser.char '"' (Done (List.rev l)))
-              lazy(Parser.char '\\' (backSlash >>= (fcons l >> readChars)))
-              lazy(Except ([], fcons l >> readChars)) ]
-    Parser.char '"' (Done ()) >>= (fun _ -> readChars []) >>= (Array.ofSeq >> System.String >> Done)
+        Parser.exactly '\\' backSlash
+        <|> Parser.except ['\\'; '"'] Done
+    Parser.exactly '"' (Done ())
+    *> Parser.repeat (readChars [])
+    >>= (Done >> Parser.exactly '"')
+    >>= (Array.ofSeq >> System.String >> Done)
 
 let private parseNum =
     // BUG: doesn't care about leading zeros
-    let digits =
-        let range = ['0';'1';'2';'3';'4';'5';'6';'7';'8';'9']
-        // List.rev gets called every time here, maybe need to add laziness at least to or
-        let rec moreDigits d = Or ( lazy(Range (range, fcons d >> moreDigits)),
-                                    lazy(Done (List.rev d)) )
-        Range (range, fcons [] >> moreDigits)
-    let eSign = Or ( lazy(Range (['+'; '-'], fun c -> digits >>= (fun l -> Done (c::l)))),
-                     lazy(digits) )
-    let e = Or ( lazy(digits >>= (fun d -> Range (['e'; 'E'], fun c -> eSign <*> (cons c >> ((@)d))))),
-                 lazy(digits) )
-    let orDot = Or ( lazy(digits >>= (fun d ->
-                        Parser.char '.' (e >>= (fun d2 -> Done (d@('.'::d2)))))),
-                     lazy (e) )
-    let minus = Or ( lazy(Parser.char '-' (Done ()) *> (orDot >>= (cons '-' >> Done))),
-                     lazy(orDot) )
-    minus <*> (Array.ofSeq >> System.String >> System.Double.Parse) <*> Number
+    let range = ['0';'1';'2';'3';'4';'5';'6';'7';'8';'9']
+    let digit = Parser.range range Done
+    let digits = digit >>= (fun c -> Parser.repeat digit <*> cons c)
+    let eSign = Parser.range ['+'; '-'] (fun c -> Done [c]) <|> Done []
+    let e =
+        Parser.range ['e'; 'E'] (fun c ->
+            eSign >>= (fun sgn ->
+                digits <*> (fun num -> [c]@sgn@num)))
+    let dec = digits >>= (fun d -> Parser.exactly '.' (digits <*> (fun d2 -> d@('.'::d2))))
+    let minus = Parser.exactly '-' (Done ['-'])
+    (minus <|> Done []) >>= (fun sgn ->
+        (dec <|> digits) >>= (fun bse ->
+            printfn "read a base %A" bse
+            (e <|> Done []) <*> (fun ev ->
+                Seq.concat [sgn; bse; ev])))
+    <*> (Array.ofSeq >> System.String >> System.Double.Parse) <*> Number
 
 let private parseString = parseStringLit <*> String
-let private parseTrue = Parser.word "true" (Bool true)
-let private parseFalse = Parser.word "false" (Bool false)
-let private parseBool = Or (lazy (parseFalse), lazy (parseTrue))
-let private parseNull = Parser.word "null" Null
+let private parseTrue = Parser.sequence "true" (Bool true)
+let private parseFalse = Parser.sequence "false" (Bool false)
+let private parseBool = parseTrue <|> parseFalse
+let private parseNull = Parser.sequence "null" Null
 
-let rec private eatWs p = Or ( lazy (Range ([' '; '\t'; '\r'; '\n'], fun _ -> eatWs p)),
-                               lazy (p) )
+let private wsc c = Parser.eatWhite *> Parser.exactly c (Done ())
+
+let private csv p =
+    p >>= (fun v -> Parser.repeat (wsc ',' *> p) <*> cons v)
 
 let rec private parseValue () =
-    Parser.orOf [ lazy(parseNum)
-                  lazy(parseString)
-                  lazy(parseBool)
-                  lazy(parseNull)
-                  lazy(parseArray ())
-                  lazy(parseObject ()) ]
+    parseNum
+    <|> parseString
+    <|> parseBool
+    <|> parseNull
+    <~> lazy (parseArray ())
+    <~> lazy (parseObject ())
 
 and private parseArray () =
-    // BUG: allows trailing comma
-    let rec getItems d =
-        eatWs ( Or ( lazy(parseValue () >>= fun v -> anotherItem (v::d)),
-                     lazy(Done (List.rev d)) ) )
-    and anotherItem d =
-        eatWs ( Or ( lazy(Parser.char ',' (getItems d)),
-                     lazy(Done d) ) )
-    
-    Parser.char '[' (getItems []) >>= (fun d -> eatWs (Parser.char ']' (Done d))) <*> List
+    let oneValue = Parser.eatWhite >>= parseValue
+    let endBracket l = wsc ']' *> Done l
+    Parser.exactly '[' (Done ())
+    *> (endBracket [] <|> (csv oneValue >>= endBracket))
+    <*> List
 
 and private parseObject () =
-    // BUG: allows trailing comma
-    let rec getItems m =
-        eatWs ( Or ( lazy(parseStringLit >>= (fun k ->
-                        eatWs (Parser.char ':' (eatWs (parseValue ()) >>= (fun v -> anotherItem (Map.add k v m)))))),
-                     lazy(Done m)))
-    and anotherItem m =
-        eatWs ( Or ( lazy(Parser.char ',' (getItems m)),
-                     lazy(Done m) ) )
-    Parser.char '{' (getItems Map.empty) >>= (fun d -> eatWs (Parser.char '}' (Done d))) <*> Object
+    let key = Parser.eatWhite *> parseStringLit
+    let value = Parser.eatWhite >>= parseValue
+    let pair = key >>= (fun k -> wsc ':' *> value <*> (fun v -> k, v))
+    let endCurl l = wsc '}' *> Done l
+    Parser.exactly '{' (Done ())
+    *> (endCurl [] <|> (csv pair >>= endCurl))
+    <*> (Map.ofSeq >> Object)
 
