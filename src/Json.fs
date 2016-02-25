@@ -53,7 +53,6 @@ let private parseNum =
     let minus = Parser.exactly '-' *> (Done ['-'])
     (minus <|> Done []) >>= (fun sgn ->
         (dec <|> digits) >>= (fun bse ->
-            printfn "read a base %A" bse
             (e <|> Done []) <*> (fun ev ->
                 Seq.concat [sgn; bse; ev])))
     <*> (Array.ofSeq >> System.String >> System.Double.Parse) <*> Number
@@ -74,8 +73,8 @@ let rec private parseValue () =
     <|> parseString
     <|> parseBool
     <|> parseNull
-    <~> lazy (parseArray ())
-    <~> lazy (parseObject ())
+    <|> Delay parseArray
+    <|> Delay parseObject
 
 and private parseArray () =
     let oneValue = Parser.eatWhite >>= parseValue
